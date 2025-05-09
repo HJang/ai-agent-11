@@ -1,5 +1,7 @@
 import asyncio
-from typing import Optional
+import json
+import os
+from typing import Optional, Dict, Any
 from contextlib import AsyncExitStack
 
 from mcp import ClientSession, StdioServerParameters
@@ -16,23 +18,55 @@ class MCPClient:
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
         self.anthropic = Anthropic()
+        self.settings: Dict[str, Any] = {}
+        self.load_settings()
 
-    async def connect_to_server(self, server_script_path: str):
-        """Connect to an MCP server
+    def load_settings(self, settings_path: str = "mcp_settings.json"):
+        """Load MCP server settings from JSON file
         
         Args:
-            server_script_path: Path to the server script (.py or .js)
+            settings_path: Path to the settings JSON file
         """
-        is_python = server_script_path.endswith('.py')
-        is_js = server_script_path.endswith('.js')
-        if not (is_python or is_js):
-            raise ValueError("Server script must be a .py or .js file")
+        try:
+            with open(settings_path, 'r') as f:
+                self.settings = json.load(f)
+            print(f"Loaded settings from {settings_path}")
+        except Exception as e:
+            print(f"Error loading settings: {str(e)}")
+            self.settings = {"mcpServers": {}}
+
+    def get_available_servers(self) -> list:
+        """Get list of available server names from settings"""
+        return list(self.settings.get("mcpServers", {}).keys())
+
+    async def connect_to_server(self, server_name: str):
+        """Connect to an MCP server using settings from config file
+        
+        Args:
+            server_name: Name of the server in the settings file
+        """
+        if server_name not in self.settings.get("mcpServers", {}):
+            raise ValueError(f"Server '{server_name}' not found in settings")
             
-        command = "python" if is_python else "node"
+        server_config = self.settings["mcpServers"][server_name]
+        
+        # Extract server parameters from config
+        command = server_config.get("command")
+        args = server_config.get("args", [])
+        env = server_config.get("env")
+        
+        if not command:
+            raise ValueError(f"Missing 'command' for server '{server_name}'")
+        
+        # Convert env dict to proper environment variables
+        env_vars = os.environ.copy()
+        if env:
+            env_vars.update(env)
+        
         server_params = StdioServerParameters(
             command=command,
-            args=[server_script_path],
-            env=None
+            args=args,
+            env=env_vars
         )
         
         stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
@@ -44,10 +78,13 @@ class MCPClient:
         # List available tools
         response = await self.session.list_tools()
         tools = response.tools
-        print("\nConnected to server with tools:", [tool.name for tool in tools])
+        print(f"\nConnected to server '{server_name}' with tools:", [tool.name for tool in tools])
 
     async def process_query(self, query: str) -> str:
         """Process a query using Claude and available tools"""
+        if not self.session:
+            return "Error: Not connected to any MCP server"
+            
         messages = [
             {
                 "role": "user",
@@ -131,14 +168,41 @@ class MCPClient:
         await self.exit_stack.aclose()
 
 async def main():
-    if len(sys.argv) < 2:
-        print("Usage: python client.py <path_to_server_script>")
-        sys.exit(1)
-        
     client = MCPClient()
+    
+    # Get available servers from settings
+    available_servers = client.get_available_servers()
+    
+    if not available_servers:
+        print("Error: No MCP servers defined in mcp_settings.json")
+        return
+    
+    # If there's only one server, use it automatically
+    if len(available_servers) == 1:
+        server_name = available_servers[0]
+    else:
+        # Let user choose which server to connect to
+        print("\nAvailable MCP servers:")
+        for i, name in enumerate(available_servers, 1):
+            print(f"{i}. {name}")
+        
+        while True:
+            try:
+                choice = input("\nSelect server number: ").strip()
+                idx = int(choice) - 1
+                if 0 <= idx < len(available_servers):
+                    server_name = available_servers[idx]
+                    break
+                else:
+                    print("Invalid selection. Please try again.")
+            except ValueError:
+                print("Please enter a number.")
+    
     try:
-        await client.connect_to_server(sys.argv[1])
+        await client.connect_to_server(server_name)
         await client.chat_loop()
+    except Exception as e:
+        print(f"Error: {str(e)}")
     finally:
         await client.cleanup()
 
